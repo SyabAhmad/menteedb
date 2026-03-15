@@ -5,6 +5,11 @@ Summary: A lightweight local vector-aware database for Python
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
 Requires-Dist: numpy>=1.24
+Requires-Dist: msgpack>=1.0.0
+Requires-Dist: cryptography>=41.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: build>=1.2; extra == "dev"
 
 # menteedb
 
@@ -15,8 +20,9 @@ menteedb is a lightweight local Python library that combines table-like records 
 - Define tables with a schema.
 - Insert structured records.
 - Enable vector search on one text field per table.
+- Add fast text contains search per table.
 - Query by field filters and/or semantic similarity.
-- Persist data locally as JSONL and NumPy arrays.
+- Persist data locally with append-only files for speed.
 
 ## Quick Start
 
@@ -37,16 +43,54 @@ db.insert("notes", {"title": "Second", "body": "I enjoy local-first tools.", "ta
 results = db.query("notes", vector_query="local vector tools", top_k=2)
 for item in results:
     print(item["score"], item["record"])
+
+text_hits = db.query("notes", text_query="local", text_fields=["body"])
+print(text_hits)
 ```
 
 ## Query Modes
 
 - Filter-only:
   - `db.query("notes", conditions={"tag": "ml"})`
+- Text contains search:
+  - `db.query("notes", text_query="vector", text_fields=["title", "body"])`
 - Vector-only:
   - `db.query("notes", vector_query="your text")`
 - Hybrid (filter + vector):
   - `db.query("notes", conditions={"tag": "dev"}, vector_query="local tools")`
+
+## Storage Layout
+
+For `base_path="./data"` and table `notes`, menteedb stores:
+
+- `./data/notes/schema.json`
+- `./data/notes/records.jsonl`
+- `./data/notes/vector_ids.jsonl`
+- `./data/notes/vectors.f32`
+
+This is local file-based storage. It is not publicly exposed over the network, but anyone with local filesystem access to this folder can read it.
+
+## Privacy and Permissions
+
+- By default, `MenteeDB(..., secure_permissions=True)` applies best-effort private permissions (`700` for table folders, `600` for files).
+- On Windows, real privacy is controlled by NTFS ACLs; chmod behavior is limited.
+
+## Testing
+
+Run locally:
+
+```bash
+pip install .[dev]
+pytest -q
+```
+
+## CI/CD to PyPI
+
+Workflow file: `.github/workflows/pypi-publish.yml`
+
+- Runs tests on pushes to `main`, tags (`v*`), and releases.
+- Publishes to PyPI on tag push (`v*`) or GitHub Release publish.
+- Uses trusted publishing via GitHub OIDC.
 
 ## Notes
 

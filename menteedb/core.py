@@ -16,8 +16,166 @@ from .file_handler import (
     load_schema,
     load_vectors,
     read_all_records,
+    set_storage_format,
     table_exists,
 )
+
+
+class QueryBuilder:
+    """Fluent query builder for constructing queries without SQL syntax."""
+
+    def __init__(self, db: MenteeDB, table_name: str):
+        self._db = db
+        self._table_name = table_name
+        self._selected_fields: Optional[List[str]] = None
+        self._conditions: List[tuple] = []
+        self._text_query: Optional[str] = None
+        self._text_fields: Optional[List[str]] = None
+        self._case_sensitive: bool = False
+        self._vector_query: Optional[str] = None
+        self._top_k: int = 5
+        self._min_score: Optional[float] = None
+
+    def select(self, *fields: str) -> QueryBuilder:
+        """
+        Select specific fields to return from each record.
+
+        Example:
+            query.select('age', 'name')
+        """
+        self._selected_fields = list(fields)
+        return self
+
+    def where(self, field: str, operator: str, value: Any) -> QueryBuilder:
+        """
+        Add a condition to filter records.
+
+        Supported operators: ==, !=, >, <, >=, <=, in, contains
+
+        Examples:
+            query.where('age', '>', 18)
+            query.where('name', '==', 'John')
+            query.where('status', 'in', ['active', 'pending'])
+            query.where('city', 'contains', 'New')
+        """
+        if operator not in ("==", "!=", ">", "<", ">=", "<=", "in", "contains"):
+            raise ValueError(f"Unsupported operator: {operator}")
+        self._conditions.append((field, operator, value))
+        return self
+
+    def search(self, query: str, in_fields: Optional[List[str]] = None, case_sensitive: bool = False) -> QueryBuilder:
+        """
+        Add a text search filter.
+
+        Example:
+            query.search('python', in_fields=['description', 'title'])
+        """
+        self._text_query = query
+        self._text_fields = in_fields
+        self._case_sensitive = case_sensitive
+        return self
+
+    def vector_search(self, query: str, top_k: int = 5, min_score: Optional[float] = None) -> QueryBuilder:
+        """
+        Add a vector similarity search.
+
+        Example:
+            query.vector_search('machine learning', top_k=10)
+        """
+        self._vector_query = query
+        self._top_k = top_k
+        self._min_score = min_score
+        return self
+
+    def execute(self) -> List[Dict[str, Any]]:
+        """Execute the query and return results."""
+        # Load all records
+        rows = read_all_records(self._db.base_path, self._table_name)
+
+        # Apply conditions
+        for field, operator, value in self._conditions:
+            rows = [r for r in rows if self._evaluate_condition(r, field, operator, value)]
+
+        # Apply text search
+        if self._text_query is not None:
+            rows = self._db._text_filter_rows(
+                rows,
+                self._text_query,
+                text_fields=self._text_fields,
+                case_sensitive=self._case_sensitive,
+            )
+
+        # Apply vector search if specified
+        if self._vector_query is not None:
+            schema = load_schema(self._db.base_path, self._table_name)
+            vector_field = schema.get("vector_field")
+            if not vector_field:
+                raise ValueError(f"Table '{self._table_name}' is not configured for vector search.")
+
+            embedding_dim = schema.get("embedding_dim")
+            ids, vectors = load_vectors(self._db.base_path, self._table_name, dimension=embedding_dim)
+
+            if vectors is not None and len(ids) > 0:
+                query_vec = self._db.embedder.encode(self._vector_query).astype(np.float32)
+                if query_vec.shape[0] != vectors.shape[1]:
+                    raise ValueError("Query embedding dimension does not match stored vectors.")
+
+                scores = self._db._cosine_scores(vectors, query_vec)
+                by_id = {row["_id"]: row for row in rows}
+
+                ranked = []
+                for idx, rid in enumerate(ids):
+                    row = by_id.get(rid)
+                    if row is None:
+                        continue
+                    score = float(scores[idx])
+                    if self._min_score is not None and score < self._min_score:
+                        continue
+                    ranked.append({"id": rid, "score": score, "record": row})
+
+                ranked.sort(key=lambda x: x["score"], reverse=True)
+                rows = [item["record"] for item in ranked[: self._top_k]]
+
+        # Select specific fields
+        if self._selected_fields:
+            rows = [self._select_fields(row, self._selected_fields) for row in rows]
+
+        # Format results
+        return [{"id": row["_id"], "data": {k: v for k, v in row.items() if k != "_id"}} for row in rows]
+
+    @staticmethod
+    def _evaluate_condition(record: Dict[str, Any], field: str, operator: str, value: Any) -> bool:
+        """Evaluate a condition against a record."""
+        record_value = record.get(field)
+
+        if operator == "==":
+            return record_value == value
+        elif operator == "!=":
+            return record_value != value
+        elif operator == ">":
+            return record_value is not None and record_value > value
+        elif operator == "<":
+            return record_value is not None and record_value < value
+        elif operator == ">=":
+            return record_value is not None and record_value >= value
+        elif operator == "<=":
+            return record_value is not None and record_value <= value
+        elif operator == "in":
+            return record_value in value
+        elif operator == "contains":
+            if isinstance(record_value, str):
+                return str(value).lower() in record_value.lower()
+            return False
+
+        return False
+
+    @staticmethod
+    def _select_fields(row: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
+        """Extract only selected fields from a record."""
+        return {
+            "_id": row["_id"],
+            **{field: row.get(field) for field in fields if field in row},
+        }
 
 
 class MenteeDB:
@@ -26,11 +184,26 @@ class MenteeDB:
         base_path: str = "./menteedb_data",
         embedder: Optional[Any] = None,
         secure_permissions: bool = True,
+        use_encryption: bool = False,
+        encryption_key: Optional[str] = None,
     ) -> None:
+        """
+        Initialize MenteeDB with optional encryption.
+
+        Args:
+            base_path: Path to store database files
+            embedder: Custom embedder instance
+            secure_permissions: Set restrictive file permissions
+            use_encryption: Enable AES-256-GCM encryption for records
+            encryption_key: Password for encryption (min 8 chars recommended)
+        """
         self.base_path = Path(base_path)
         ensure_path(self.base_path)
         self.embedder = embedder or HashingEmbedder()
         self.secure_permissions = secure_permissions
+        
+        # Configure storage format with encryption if requested
+        set_storage_format(use_encryption=use_encryption, encryption_key=encryption_key)
 
     def create_table(self, table_name: str, fields: Dict[str, str], vector_field: Optional[str] = None) -> Dict[str, Any]:
         if not table_name or not isinstance(table_name, str):
@@ -94,6 +267,15 @@ class MenteeDB:
             )
 
         return {"ok": True, "id": rid}
+
+    def find(self, table_name: str) -> QueryBuilder:
+        """
+        Start building a query. Use this to access the fluent query API.
+
+        Example:
+            results = db.find('users').where('age', '>', 18).select('name', 'email').execute()
+        """
+        return QueryBuilder(self, table_name)
 
     def query(
         self,

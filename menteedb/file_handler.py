@@ -1,11 +1,71 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import msgpack
 import numpy as np
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+
+
+class StorageFormat:
+    """Encryption and format configuration for storage."""
+
+    def __init__(self, use_encryption: bool = False, encryption_key: Optional[str] = None):
+        """
+        Initialize storage format.
+
+        Args:
+            use_encryption: Enable AES-256-GCM encryption
+            encryption_key: Password for encryption (min 8 chars). If None, a default is used.
+        """
+        self.use_encryption = use_encryption
+        self._encryption_key = encryption_key
+
+    def _derive_key(self) -> bytes:
+        """Derive a 32-byte AES key from password using PBKDF2HMAC."""
+        password = (self._encryption_key or "default").encode()
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=b"menteedb_salt", iterations=100000)
+        return kdf.derive(password)
+
+    def encrypt_data(self, data: bytes) -> bytes:
+        """Encrypt data with AES-256-GCM, return: IV + ciphertext + tag."""
+        if not self.use_encryption:
+            return data
+
+        import os
+
+        key = self._derive_key()
+        iv = os.urandom(12)  # 96-bit IV for GCM
+        cipher = AESGCM(key)
+        ciphertext = cipher.encrypt(iv, data, None)
+        return iv + ciphertext
+
+    def decrypt_data(self, encrypted: bytes) -> bytes:
+        """Decrypt AES-256-GCM data. Expects: IV + ciphertext + tag."""
+        if not self.use_encryption:
+            return encrypted
+
+        key = self._derive_key()
+        iv = encrypted[:12]
+        ciphertext_with_tag = encrypted[12:]
+        cipher = AESGCM(key)
+        return cipher.decrypt(iv, ciphertext_with_tag, None)
+
+
+# Global storage format (can be configured per MenteeDB instance)
+_global_storage_format = StorageFormat(use_encryption=False)
+
+
+def set_storage_format(use_encryption: bool = False, encryption_key: Optional[str] = None) -> None:
+    """Configure global storage format for all operations."""
+    global _global_storage_format
+    _global_storage_format = StorageFormat(use_encryption=use_encryption, encryption_key=encryption_key)
 
 
 def ensure_path(path: Path) -> None:
@@ -78,8 +138,18 @@ def load_schema(base_path: Path, table_name: str) -> Dict[str, Any]:
 
 def append_record(base_path: Path, table_name: str, record: Dict[str, Any], secure_permissions: bool = True) -> None:
     rpath = records_path(base_path, table_name)
-    with rpath.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=True) + "\n")
+    
+    # Serialize record to MessagePack (compact binary format)
+    data = msgpack.packb(record, use_bin_type=True)
+    
+    # Encrypt if enabled
+    data = _global_storage_format.encrypt_data(data)
+    
+    # Append as binary with length prefix for easy chunking
+    with rpath.open("ab") as f:
+        f.write(len(data).to_bytes(4, byteorder="big"))
+        f.write(data)
+    
     if secure_permissions:
         _apply_private_permissions(rpath, is_dir=False)
 
@@ -90,11 +160,49 @@ def read_all_records(base_path: Path, table_name: str) -> List[Dict[str, Any]]:
         return []
 
     items: List[Dict[str, Any]] = []
-    with rpath.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                items.append(json.loads(line))
+    
+    # Check if file has the new binary format or old JSON format
+    try:
+        with rpath.open("rb") as f:
+            content = f.read()
+            if not content:
+                return []
+        
+        # Try reading as new binary format (length-prefixed msgpack)
+        offset = 0
+        while offset < len(content):
+            if offset + 4 > len(content):
+                break
+            length = int.from_bytes(content[offset : offset + 4], byteorder="big")
+            offset += 4
+            
+            if offset + length > len(content):
+                break
+            
+            data = content[offset : offset + length]
+            offset += length
+            
+            # Decrypt if enabled
+            data = _global_storage_format.decrypt_data(data)
+            
+            # Deserialize from MessagePack
+            record = msgpack.unpackb(data, raw=False)
+            items.append(record)
+        
+        return items
+    except Exception:
+        pass
+    
+    # Fallback: try reading as old JSON format for backward compatibility
+    try:
+        with rpath.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    items.append(json.loads(line))
+    except Exception:
+        pass
+    
     return items
 
 
