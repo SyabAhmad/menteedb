@@ -1,4 +1,5 @@
 # /.github
 /.pytest_cache
 /.venv
-/tests
+tests
+menteedb

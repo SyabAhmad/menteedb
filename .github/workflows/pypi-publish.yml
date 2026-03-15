@@ -1,5 +1,8 @@
 name: CI and Publish to PyPI
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
   push:
     branches:
@@ -28,7 +31,9 @@ jobs:
           pip install .[dev]
 
       - name: Run tests
-        run: pytest -q
+        run: |
+          test -d tests
+          pytest -q tests
 
       - name: Build distribution
         run: python -m build
