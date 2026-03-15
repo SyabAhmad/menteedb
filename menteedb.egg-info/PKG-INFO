@@ -1,0 +1,54 @@
+Metadata-Version: 2.4
+Name: menteedb
+Version: 0.1.0
+Summary: A lightweight local vector-aware database for Python
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+
+# menteedb
+
+menteedb is a lightweight local Python library that combines table-like records with optional vector similarity search.
+
+## Features
+
+- Define tables with a schema.
+- Insert structured records.
+- Enable vector search on one text field per table.
+- Query by field filters and/or semantic similarity.
+- Persist data locally as JSONL and NumPy arrays.
+
+## Quick Start
+
+```python
+from menteedb import MenteeDB
+
+db = MenteeDB(base_path="./data")
+
+db.create_table(
+    table_name="notes",
+    fields={"title": "str", "body": "str", "tag": "str"},
+    vector_field="body",
+)
+
+db.insert("notes", {"title": "First", "body": "Vector databases are useful.", "tag": "ml"})
+db.insert("notes", {"title": "Second", "body": "I enjoy local-first tools.", "tag": "dev"})
+
+results = db.query("notes", vector_query="local vector tools", top_k=2)
+for item in results:
+    print(item["score"], item["record"])
+```
+
+## Query Modes
+
+- Filter-only:
+  - `db.query("notes", conditions={"tag": "ml"})`
+- Vector-only:
+  - `db.query("notes", vector_query="your text")`
+- Hybrid (filter + vector):
+  - `db.query("notes", conditions={"tag": "dev"}, vector_query="local tools")`
+
+## Notes
+
+- This initial version supports one vector field per table.
+- Default embeddings use a deterministic local hashing embedder with no external model download.

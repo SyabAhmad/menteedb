@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+./menteedb/__init__.py
+./menteedb/core.py
+./menteedb/embeddings.py
+./menteedb/file_handler.py
+menteedb.egg-info/PKG-INFO
+menteedb.egg-info/SOURCES.txt
+menteedb.egg-info/dependency_links.txt
+menteedb.egg-info/requires.txt
+menteedb.egg-info/top_level.txt
